@@ -88,7 +88,7 @@ EFI_STATUS EFIAPI UefiMain(IN EFI_HANDLE ImageHandle, IN EFI_SYSTEM_TABLE *Syste
     // MemoryMap + MemoryMapSize = MemoryMap 結束處，所以當current_desc 小於結束地址，就要不斷增加
     // 伏位: UEFI spec寫明唔可以 current_desc ++， 因為sizeof(EFI_MEMORY_DESCRIPTOR) 未必係DescriptorSize
     while((char*)current_desc < (char*)MemoryMap+ MemoryMapSize){
-        Print(L"Mem [Type:%d] [Phys:%x to %x] [VirStart:%x] [NoOfPages:%d] [Attribute:%x]\n", 
+        Print(L"Mem [Type:%d] [Phys:%lx to %lx] [VirStart:%lx] [NoOfPages:%d] [Attribute:%x]\n", 
             current_desc->Type, 
             current_desc->PhysicalStart, 
             current_desc->PhysicalStart + 4096 * current_desc->NumberOfPages - 1, 
