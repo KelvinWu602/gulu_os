@@ -87,16 +87,16 @@ EFI_STATUS EFIAPI UefiMain(IN EFI_HANDLE ImageHandle, IN EFI_SYSTEM_TABLE *Syste
     EFI_MEMORY_DESCRIPTOR* current_desc = (EFI_MEMORY_DESCRIPTOR*)MemoryMap;
     // MemoryMap + MemoryMapSize = MemoryMap 結束處，所以當current_desc 小於結束地址，就要不斷增加
     // 伏位: UEFI spec寫明唔可以 current_desc ++， 因為sizeof(EFI_MEMORY_DESCRIPTOR) 未必係DescriptorSize
-    while((char*)current_desc < (char*)MemoryMap+ MemoryMapSize){
-        Print(L"Mem [Type:%d] [Phys:%lx to %lx] [VirStart:%lx] [NoOfPages:%d] [Attribute:%x]\n", 
+    while((UINT8*)current_desc < (UINT8*)MemoryMap+ MemoryMapSize){
+        Print(L"Mem [Type:%d] [Phys:%lx to %lx] [VirStart:%lx] [NoOfPages:%ld] [Attribute:%lx]\n", 
             current_desc->Type, 
             current_desc->PhysicalStart, 
-            current_desc->PhysicalStart + 4096 * current_desc->NumberOfPages - 1, 
+            current_desc->PhysicalStart + (current_desc->NumberOfPages << 12) - 1, 
             current_desc->VirtualStart, 
             current_desc->NumberOfPages, 
             current_desc->Attribute
         );
-        current_desc = (EFI_MEMORY_DESCRIPTOR*)((char*)current_desc + DescriptorSize);
+        current_desc = (EFI_MEMORY_DESCRIPTOR*)((UINT8*)current_desc + DescriptorSize);
     }
     // 釋放MemoryMap空間
     // 伏位：AllocatePages 對應 FreePages，之前用錯FreePool會導致hang機。
