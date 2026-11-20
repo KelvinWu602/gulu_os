@@ -1,0 +1,3 @@
+BOOTx64.efi is the UEFI shell
+BootLoader.efi is built from BootLoader.c 
+startup.nsh is the start up script that will be executed automatically by UEFI shell on boot.
