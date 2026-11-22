@@ -8,17 +8,29 @@ Target Physical Memory Layout:
 
 Details see deviceinfo.txt
 
+本程序有三個任務：
+1. 獲取系統Memory Map，以確定系統哪些記憶體可供操作系統使用
+2. 獲取當前顯示模式的FrameBuffer位置，並設定好Memory Map
+3. 從ESP分區讀取kernel.bin並加載至記憶體，並跳轉至kernel.bin的第一行開始執行
+
+執行順序：
+1. 先加載kernel.bin (已包括PageTables)
+2. 獲取FrameBuffer，設定好PageTables將Base Address映射至虛擬地址
+3. 獲取最新MemoryMap
+4. 跳轉至kernel.bin
 */
 
 #include <Uefi.h>
 #include <Library/UefiLib.h>
+#include <Protocol/LoadedImage.h>
+#include <Guid/FileInfo.h> 
 
 #define COUNT_PAGES(bytes)  ((bytes+4095)>>12)
 
 // 先設定好會傳給kernel的數據結構，由於要跨binary傳數據，kernel和bootloader所用的編譯器和ABI稍有不同，就會有不同的padding behavior。
-// 避免牛頭不對馬嘴，寫明不需要padding，用__attribute__((packed))
+// 避免拆包裹的人拿錯數據，寫明不需要padding，用__attribute__((packed))
 // 另外unsigned int, unsigned long的實際長度都depends on ABI，因此改用UEFI types
-// 大原則：跨binary數據傳輸越explicit越死越好
+// 大原則：跨binary就不能假設ABI相同，數據定義越explicit越死越好
 struct EFI_GRAPHICS_OUTPUT_INFORMATION {
     UINT32 HorizontalResolution;
     UINT32 VerticalResolution;
@@ -35,7 +47,7 @@ struct EFI_E820_MEMORY_DESCRIPTOR {
 
 struct EFI_E820_MEMORY_DESCRIPTOR_INFORMATION {
     UINT32 E820_Entry_Count;
-    struct EFI_E820_MEMORY_DESCRIPTOR E820_Entry[0];    // 將會是陣列首元素
+    struct EFI_E820_MEMORY_DESCRIPTOR E820_Entry[0];    // C 動態陣列寫法
 } __attribute__((packed));
 
 struct KERNEL_BOOT_PARAMETER_INFORMATION {
@@ -47,157 +59,113 @@ struct KERNEL_BOOT_PARAMETER_INFORMATION {
 EFI_STATUS EFIAPI UefiMain(IN EFI_HANDLE ImageHandle, IN EFI_SYSTEM_TABLE *SystemTable) { 
     // 獲取UEFI Boot Service
     EFI_BOOT_SERVICES* gBS = SystemTable->BootServices;
-    EFI_PHYSICAL_ADDRESS pages;
-    EFI_STATUS status;
-
-    // 任務1:是要將kernel.bin讀入內存，先假設kernel.bin必定位於bootloader所在分區內。
-
-    // 首先獲取當前Image的資訊，可以使用LoadedImageProtocol。
-    // HandleProtocol 用於查看某特定Handle是否支援某特定Protocol。
-    EFI_LOADED_IMAGE_PROTOCOL* loadedImage;
-    status = gBS->HandleProtocol(ImageHandle, &gEfiLoadedImageProtocolGuid, &loadedImage);
-    if(status!=EFI_SUCCESS){
-        return status;
+    EFI_PHYSICAL_ADDRESS Pages;
+    EFI_STATUS Status;
+    
+    // 本程序假設kernel.bin必定位於本程序所在分區內。
+    // 首先使用LoadedImageProtocol獲取本程序的DeviceHandle(硬碟/USB)。
+    EFI_LOADED_IMAGE_PROTOCOL* LoadedImageProtocol;
+    Status = gBS->HandleProtocol(ImageHandle, &gEfiLoadedImageProtocolGuid, (VOID**)&LoadedImageProtocol);
+    if(Status!=EFI_SUCCESS){
+        return Status;
     }
-
-    // 查看設備Handle是否支援FAT
-    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL* fs;
-    status = gBS->HandleProtocol(loadedImage->DeviceHandle, &gEfiSimpleFileSystemProtocolGuid, &fs);
-    if(status!=EFI_SUCCESS){
-        return status;
+    // 查看儲存設備分區是否支援FAT
+    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL* FS;
+    Status = gBS->HandleProtocol(LoadedImageProtocol->DeviceHandle, &gEfiSimpleFileSystemProtocolGuid, (VOID**)&FS);
+    if(Status!=EFI_SUCCESS){
+        return Status;
     }
 
     // 確認支援FAT後，嘗試打開根目錄 (類似Shell中運行fs0:)
-    /**
-    @retval EFI_SUCCESS          The device was opened.
-    @retval EFI_UNSUPPORTED      This volume does not support the requested file system type.
-    @retval EFI_NO_MEDIA         The device has no medium.
-    @retval EFI_DEVICE_ERROR     The device reported an error.
-    @retval EFI_VOLUME_CORRUPTED The file system structures are corrupted.
-    @retval EFI_ACCESS_DENIED    The service denied access to the file.
-    @retval EFI_OUT_OF_RESOURCES The volume was not opened due to lack of resources.
-    @retval EFI_MEDIA_CHANGED    The device has a different medium in it or the medium is no
-                                longer supported. Any existing file handles for this volume are
-                                no longer valid. To access the files on the new medium, the
-                                volume must be reopened with OpenVolume().
-    **/
-    EFI_FILE_PROTOCOL* fsroot;
-    status = fs->OpenVolume(fs, &fsroot);
-    if(status!=EFI_SUCCESS){
-        return status;
+    EFI_FILE_PROTOCOL* FSRoot;
+    Status = FS->OpenVolume(FS, &FSRoot);
+    if(Status!=EFI_SUCCESS){
+        return Status;
     }
     
-    // 開啟檔案
-    EFI_FILE_HANDLE kernelFile; // EFI_FILE_PROTOCOL**
-    status = fsroot->Open(fsroot, &kernelFile, (CHAR16*)L"kernel.bin", EFI_FILE_MODE_READ, 0); // Attribute = 0 is for create file only
-    if(status!=EFI_SUCCESS){
-        Print(L"Cannot open kernel.bin\n");
-        return status;
+    // 開啟kernel.bin檔案
+    EFI_FILE_HANDLE KernelBin; // EFI_FILE_PROTOCOL**
+    Status = FSRoot->Open(FSRoot, &KernelBin, (CHAR16*)L"kernel.bin", EFI_FILE_MODE_READ, 0); 
+    if(Status!=EFI_SUCCESS){
+        return Status;
     }
+    Print(L"Open kernel.bin\t\t\t\tSuccess\n");
 
     // 拿取檔案資料
-    /**
-    typedef
-    EFI_STATUS
-    (EFIAPI *EFI_FILE_GET_INFO)(
-        IN EFI_FILE_PROTOCOL        *This,
-        IN EFI_GUID                 *InformationType,
-        IN OUT UINTN                *BufferSize,
-        OUT VOID                    *Buffer
-    );
-     */
-    UINTN fileInfoSize = 0;
-    EFI_FILE_INFO* fileinfo = NULL;
-    // 試大小
-    status = fsroot->GetInfo(fsroot, &gEfiFileInfoGuid, &fileInfoSize, fileinfo);
-    if(status!=EFI_BUFFER_TOO_SMALL){
-        return status;
+    EFI_FILE_INFO* FileInfo = NULL;
+    UINTN FileInfoSize = 0;
+    Status = KernelBin->GetInfo(KernelBin, &gEfiFileInfoGuid, &FileInfoSize, FileInfo);
+    if(Status!=EFI_BUFFER_TOO_SMALL){
+        return Status;
     }
-    // 分配Pool，LoaderData會在Kernel讀完參數後才回收
-    status = gBS->AllocatePool(EfiLoaderData, fileInfoSize, (VOID**) &fileinfo);
-    if(status != EFI_SUCCESS){
-        return status;
+    // 分配Pool，先放在EfiBootServicesData，即使忘記FreePool也能在ExitBootServices後自動回收
+    Status = gBS->AllocatePool(EfiBootServicesData, FileInfoSize, (VOID**) &FileInfo);
+    if(Status != EFI_SUCCESS){
+        return Status;
     }
-    status = fsroot->GetInfo(fsroot, &gEfiFileInfoGuid, &fileInfoSize, fileinfo);
-    if(status != EFI_SUCCESS){
-        return status;
+    Status = KernelBin->GetInfo(KernelBin, &gEfiFileInfoGuid, &FileInfoSize, FileInfo);
+    if(Status != EFI_SUCCESS){
+        return Status;
     }
-    UINT64 KERNEL_BIN_SIZE = fileinfo->FileSize;
-    gBS->FreePool(fileinfo);
+    // 獲取檔案大小以計算需要多少內存頁裝填kernel.bin
+    UINT64 KERNEL_BIN_SIZE = FileInfo->FileSize;
+    gBS->FreePool(FileInfo);
+    Print(L"File Name: %s\tSize: %d\tNo Of Pages: %d\n", FileInfo->FileName, KERNEL_BIN_SIZE, COUNT_PAGES(KERNEL_BIN_SIZE));
 
     // 分配內存頁以裝載kernel.bin，需要裝到特定address上
     // 選擇0x100000作為內核開始位置，因為多數UEFI firmware都會在這個地址留下幾MB空間。
     // EfiLoaderCode： UEFI固件完全唔會觸碰、唔會移動、亦唔會重定位。
-    pages = 0x100000;
-    status = gBS->AllocatePages(AllocateAddress, EfiLoaderCode, COUNT_PAGES(KERNEL_BIN_SIZE), &pages);
-    if(status != EFI_SUCCESS){
-        return status;
+    Pages = 0x100000;
+    Status = gBS->AllocatePages(AllocateAddress, EfiLoaderCode, COUNT_PAGES(KERNEL_BIN_SIZE), &Pages);
+    if(Status != EFI_SUCCESS){
+        return Status;
     }
-    
-    /**
-    typedef
-    EFI_STATUS
-    (EFIAPI *EFI_FILE_READ)(
-    IN EFI_FILE_PROTOCOL        *This,
-    IN OUT UINTN                *BufferSize,
-    OUT VOID                    *Buffer
-    );
-    */
-    status = kernelFile->Read(kernelFile, &KERNEL_BIN_SIZE, (VOID*) pages);
-    if(status!=EFI_SUCCESS){
-        Print(L"Cannot read kernel.bin into memory\n");
-        return status;
+    Status = KernelBin->Read(KernelBin, &KERNEL_BIN_SIZE, (VOID*) Pages);
+    if(Status!=EFI_SUCCESS){
+        return Status;
     }
+    Print(L"Load kernel.bin\t\t\t\tSuccess\n");
+    Print(L"kernel.bin occupied physical address %016lx to %016lx, requires %d 4KB Pages\n", Pages, (CHAR8*)Pages + (COUNT_PAGES(KERNEL_BIN_SIZE) << 12), COUNT_PAGES(KERNEL_BIN_SIZE));
 
-    kernelFile->Close(kernelFile);
-    fsroot->Close(fsroot);
-    
-    
-    gBS->CloseProtocol(loadedImage->DeviceHandle, &gEfiSimpleFileSystemProtocolGuid, ImageHandle, NULL);
+    // 關閉資源
+    KernelBin->Close(KernelBin);
+    FSRoot->Close(FSRoot);
+    gBS->CloseProtocol(LoadedImageProtocol->DeviceHandle, &gEfiSimpleFileSystemProtocolGuid, ImageHandle, NULL);
     gBS->CloseProtocol(ImageHandle, &gEfiLoadedImageProtocolGuid, ImageHandle, NULL);
 
-    // 任務2:準備一內存頁以填裝KERNEL_BOOT_PARAMETER_INFORMATION
-    pages = 0x60000;
-    status = gBS->AllocatePages(AllocateAddress, EfiLoaderData, 1, &pages);
-    if(status!=EFI_SUCCESS){
-        return status;
+    // 準備一內存頁以填裝KERNEL_BOOT_PARAMETER_INFORMATION
+    Pages = 0x60000;
+    Status = gBS->AllocatePages(AllocateAddress, EfiLoaderData, 1, &Pages);
+    if(Status!=EFI_SUCCESS){
+        return Status;
     }
-    status = gBS->SetMem((VOID*) pages, 0x1000, 0); // 0x1000 = 4KB
-    if(status!=EFI_SUCCESS){
-        return status;
-    }
-    struct KERNEL_BOOT_PARAMETER_INFORMATION* bootParams = (struct KERNEL_BOOT_PARAMETER_INFORMATION*)pages;
+    gBS->SetMem((VOID*) Pages, 0x1000, 0); // 0x1000 = 4KB
+    struct KERNEL_BOOT_PARAMETER_INFORMATION* BootParams = (struct KERNEL_BOOT_PARAMETER_INFORMATION*)Pages;
 
-    // 任務3: 準備填充顯示模式訊息
-    // 查看顯示模式需要用到UEFI中的Graphics Output Protocol
-    EFI_GRAPHICS_OUTPUT_PROTOCOL* gop = NULL;
+    // 準備填充顯示模式訊息，查看顯示模式需要用到UEFI中的Graphics Output Protocol
+    EFI_GRAPHICS_OUTPUT_PROTOCOL* GOP = NULL;
 
-    // LocateProtocol的作用是返回系統中所有支援此Protocol的Handle(設備), 所以gop是一個陣列
-    gBS->LocateProtocol(&gEfiGraphicsOutputProtocolGuid, 0, (VOID **) &gop);
-    Print(L"(Current Mode) Resolution: (%d x %d), FrameBuffer Address: (%x, size: %d)\n", 
-        gop->Mode->Info->HorizontalResolution, gop->Mode->Info->VerticalResolution, 
-        gop->Mode->FrameBufferBase, gop->Mode->FrameBufferSize
-    );
-    bootParams->Graphics_Info.HorizontalResolution = gop->Mode->Info->HorizontalResolution;
-    bootParams->Graphics_Info.VerticalResolution = gop->Mode->Info->VerticalResolution;
-    bootParams->Graphics_Info.PixelsPerScanLine = gop->Mode->Info->PixelsPerScanLine;
-    bootParams->Graphics_Info.FrameBufferBase = gop->Mode->FrameBufferBase;
-    bootParams->Graphics_Info.FrameBufferSize = gop->Mode->FrameBufferSize;
+    // LocateProtocol的作用是返回系統中所有支援此Protocol的Handle(設備), 所以GOP是一個陣列
+    gBS->LocateProtocol(&gEfiGraphicsOutputProtocolGuid, 0, (VOID **) &GOP);
+    Print(L"Get FrameBuffer\t\t\t\tSuccess\n");
+    Print(L"(Current Mode) Resolution: (%d x %d)\n", GOP->Mode->Info->HorizontalResolution, GOP->Mode->Info->VerticalResolution);
+    Print(L"FrameBuffer occupied physical address %016lx to %016lx, size: %d B\n", GOP->Mode->FrameBufferBase, GOP->Mode->FrameBufferBase + GOP->Mode->FrameBufferSize, GOP->Mode->FrameBufferSize);
+    BootParams->Graphics_Info.HorizontalResolution = GOP->Mode->Info->HorizontalResolution;
+    BootParams->Graphics_Info.VerticalResolution = GOP->Mode->Info->VerticalResolution;
+    BootParams->Graphics_Info.PixelsPerScanLine = GOP->Mode->Info->PixelsPerScanLine;
+    BootParams->Graphics_Info.FrameBufferBase = GOP->Mode->FrameBufferBase;
+    BootParams->Graphics_Info.FrameBufferSize = GOP->Mode->FrameBufferSize;
 
-    gBS->CloseProtocol(gop, &gEfiGraphicsOutputProtocolGuid, ImageHandle, NULL);
+    gBS->CloseProtocol(GOP, &gEfiGraphicsOutputProtocolGuid, ImageHandle, NULL);
 
-    // 任務四：要Overwrite kernel.bin中設定的Page Table，將FrameBuffer的物理地址 0x8000000 map至 Virtual Address 0xffff800003000000 
+    // Overwrite kernel.bin中設定的Page Table，將FrameBuffer的物理地址 0x8000000 map至 Virtual Address 0xffff800003000000 
     UINT64* PageTableEntry = (UINT64*) 0x103000; //level 3 Page Table (2MB Big Page is ON after kernel change page tables)
-    for(int i = 0;i < (bootParams->Graphics_Info.FrameBufferSize + 0x200000 - 1) >> 21 ; i++){
+    for(int i = 0;i < (BootParams->Graphics_Info.FrameBufferSize + 0x200000 - 1) >> 21 ; i++){
         //0xffff800003000000 對應 level 3 page table 24th entry
-        *(PageTableEntry + 24 + i) = bootParams->Graphics_Info.FrameBufferBase | 0x200000 * i | 0x87; // ring 3 RW
-        Print(L"Page %2d, Address: %018lx, Value: %018lx\n", i, (UINT64)(PageTableEntry+24+i), *(PageTableEntry+24+i));
+        *(PageTableEntry + 24 + i) = BootParams->Graphics_Info.FrameBufferBase | 0x200000 * i | 0x87; // ring 3 RW
     }
 
-    // 任務五: 準備填充Memory Map訊息
-
-
-    // 準備Meta Data
+    // 準備填充Memory Map訊息
     EFI_MEMORY_DESCRIPTOR* MemoryMap = NULL;
     UINTN MemoryMapSize = 0;
     UINTN MapKey = 0;   // Idempotent Key
@@ -205,26 +173,26 @@ EFI_STATUS EFIAPI UefiMain(IN EFI_HANDLE ImageHandle, IN EFI_SYSTEM_TABLE *Syste
     UINT32 DescriptorVersion = 0;
 
     // 獲取Memory Map大小
-    status = gBS->GetMemoryMap(&MemoryMapSize, MemoryMap, &MapKey, &DescriptorSize, &DescriptorVersion);
-    if(status!=EFI_BUFFER_TOO_SMALL){
-        return status;
+    Status = gBS->GetMemoryMap(&MemoryMapSize, MemoryMap, &MapKey, &DescriptorSize, &DescriptorVersion);
+    if(Status!=EFI_BUFFER_TOO_SMALL){
+        return Status;
     }
     MemoryMapSize += DescriptorSize * 5; // 預留多幾個Descriptor，因為下面要AllocatePool，萬一Pool滿左，用了新頁，就會多了兩個Descriptor。
 
     // 分配Memory Pool裝載Memory Map
-    status = gBS->AllocatePool(EfiBootServicesData, MemoryMapSize, (VOID**)&MemoryMap);
-    if(status != EFI_SUCCESS){
-        return status;
+    Status = gBS->AllocatePool(EfiBootServicesData, MemoryMapSize, (VOID**)&MemoryMap);
+    if(Status != EFI_SUCCESS){
+        return Status;
     }
 
     // 今次帶著剛分配的Memory 作為Buffer去重新獲取Memory Map
-    status = gBS->GetMemoryMap(&MemoryMapSize, MemoryMap, &MapKey, &DescriptorSize, &DescriptorVersion);
-    if(status!=EFI_SUCCESS){
-        return status;
+    Status = gBS->GetMemoryMap(&MemoryMapSize, MemoryMap, &MapKey, &DescriptorSize, &DescriptorVersion);
+    if(Status!=EFI_SUCCESS){
+        return Status;
     }
 
     // 每一個Memory Descriptor，都要按Memory Type 分類，和前一個同類相連Descriptor合併。
-    struct EFI_E820_MEMORY_DESCRIPTOR* currentE820 = bootParams->E820_Info.E820_Entry;
+    struct EFI_E820_MEMORY_DESCRIPTOR* currentE820 = BootParams->E820_Info.E820_Entry;
     struct EFI_E820_MEMORY_DESCRIPTOR* LastE820 = NULL;
     unsigned int E820_Count = 0;
     UINT64 LastEndAddr = 0;
@@ -286,8 +254,8 @@ EFI_STATUS EFIAPI UefiMain(IN EFI_HANDLE ImageHandle, IN EFI_SYSTEM_TABLE *Syste
         }
     }
 
-    currentE820 = bootParams->E820_Info.E820_Entry;
-    bootParams->E820_Info.E820_Count = E820_Count;
+    currentE820 = BootParams->E820_Info.E820_Entry;
+    BootParams->E820_Info.E820_Entry_Count = E820_Count;
     struct EFI_E820_MEMORY_DESCRIPTOR temp;
     // E820 descriptor 按地址排序
     for(int i = 0 ; i < E820_Count ; i++){
@@ -304,17 +272,18 @@ EFI_STATUS EFIAPI UefiMain(IN EFI_HANDLE ImageHandle, IN EFI_SYSTEM_TABLE *Syste
 
     // Print E820 Memory Map
     for(int i = 0; i < E820_Count; i++){
-        Print(L"MemoryMap (%10lx to %10lx) %4d\n", currentE820->address, currentE820->address + currentE820->length, currentE820->type);
+        Print(L"E820 MemoryMap (%016lx to %016lx), Type = %4d\n", currentE820->address, currentE820->address + currentE820->length, currentE820->type);
         currentE820++;
     }
 
     gBS->FreePool(MemoryMap);
 
     // 跳去kernel.bin!!
+    Print(L"Jump to the kernel. Leap of Fate!!! \n"); // Print 一定要在GetMemoryMap前，因為Print本身有機會影響Memory Map，kind of like 量子力學測不準定理
     gBS->GetMemoryMap(&MemoryMapSize, MemoryMap, &MapKey, &DescriptorSize, &DescriptorVersion);
-    status = gBS->ExitBootServices(ImageHandle, MapKey);
-    if(status!=EFI_SUCCESS){
-        return status;
+    Status = gBS->ExitBootServices(ImageHandle, MapKey);
+    if(Status!=EFI_SUCCESS){
+        return Status;
     }
     
     void (*func) (void);

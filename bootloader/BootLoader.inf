@@ -16,10 +16,14 @@
 [LibraryClasses]
   UefiApplicationEntryPoint
   UefiLib
+  UefiBootServicesTableLib
 
 [Protocols]
   gEfiGraphicsOutputProtocolGuid
+  gEfiSimpleFileSystemProtocolGuid
+  gEfiLoadedImageProtocolGuid
   
 [Guids]
+  gEfiFileInfoGuid
   
 
